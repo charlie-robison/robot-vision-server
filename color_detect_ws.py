@@ -11,60 +11,73 @@ import websockets
 SAVE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "received_images")
 os.makedirs(SAVE_DIR, exist_ok=True)
 
-# HSV color ranges mapped to human-readable names
-COLOR_RANGES = [
-    ((0, 70, 50), (10, 255, 255), "red"),
-    ((170, 70, 50), (180, 255, 255), "red"),
-    ((11, 70, 50), (25, 255, 255), "orange"),
-    ((26, 70, 50), (34, 255, 255), "yellow"),
-    ((35, 70, 50), (85, 255, 255), "green"),
-    ((86, 70, 50), (125, 255, 255), "blue"),
-    ((126, 70, 50), (145, 255, 255), "purple"),
-    ((146, 70, 50), (169, 255, 255), "pink"),
+# HSV ranges that cover brown tones including dark wood
+BROWN_RANGES = [
+    ((8, 30, 10), (20, 255, 160)),
+    ((20, 30, 10), (30, 255, 130)),
 ]
 
+# Minimum percentage of non-background pixels that must be brown to return True
+BROWN_THRESHOLD_PCT = 20.0
 
-def detect_dominant_color(image: np.ndarray) -> dict:
-    """Detect the dominant color of the main object in the image using OpenCV."""
+# Obstruction detection thresholds
+OBSTRUCTION_BRIGHTNESS_DIFF = 40  # min difference in mean V between halves
+OBSTRUCTION_DARK_THRESHOLD = 50   # absolute mean V below which a side is "dark"
+
+
+def detect_obstruction(image: np.ndarray) -> str | None:
+    """Return 'LEFT' or 'RIGHT' to steer away from an obstructed side, or None."""
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    v_channel = hsv[:, :, 2]
+
+    mid_x = v_channel.shape[1] // 2
+    left_mean = float(np.mean(v_channel[:, :mid_x]))
+    right_mean = float(np.mean(v_channel[:, mid_x:]))
+
+    diff = abs(left_mean - right_mean)
+
+    # One side is much darker than the other → steer away from the dark side
+    if diff >= OBSTRUCTION_BRIGHTNESS_DIFF:
+        return "RIGHT" if left_mean < right_mean else "LEFT"
+
+    # One side has very low absolute brightness → close dark object
+    if left_mean < OBSTRUCTION_DARK_THRESHOLD and right_mean >= OBSTRUCTION_DARK_THRESHOLD:
+        return "RIGHT"
+    if right_mean < OBSTRUCTION_DARK_THRESHOLD and left_mean >= OBSTRUCTION_DARK_THRESHOLD:
+        return "LEFT"
+
+    return None
+
+
+def detect_brown_direction(image: np.ndarray) -> str | None:
+    """Return 'LEFT' or 'RIGHT' to avoid a brown object, or None if no brown detected."""
     hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
 
-    # Build a mask to ignore near-black and near-white (background) pixels
-    mask = cv2.inRange(hsv, (0, 30, 30), (180, 255, 255))
+    # Ignore near-black and near-white background pixels
+    fg_mask = cv2.inRange(hsv, (0, 10, 10), (180, 255, 255))
+    fg_pixels = int(cv2.countNonZero(fg_mask))
+    if fg_pixels == 0:
+        return None
 
-    # Count pixels for each named color range
-    color_counts: dict[str, int] = {}
-    for lower, upper, name in COLOR_RANGES:
-        color_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
-        combined = cv2.bitwise_and(color_mask, mask)
-        count = int(cv2.countNonZero(combined))
-        color_counts[name] = color_counts.get(name, 0) + count
+    # Build combined brown mask
+    brown_mask = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    for lower, upper in BROWN_RANGES:
+        range_mask = cv2.inRange(hsv, np.array(lower), np.array(upper))
+        brown_mask = cv2.bitwise_or(brown_mask, range_mask)
+    brown_mask = cv2.bitwise_and(brown_mask, fg_mask)
 
-    # Check for white / gray / black regions
-    white_mask = cv2.inRange(hsv, (0, 0, 200), (180, 30, 255))
-    color_counts["white"] = int(cv2.countNonZero(white_mask))
+    brown_pixels = int(cv2.countNonZero(brown_mask))
+    brown_pct = brown_pixels / fg_pixels * 100
+    if brown_pct < BROWN_THRESHOLD_PCT:
+        return None
 
-    gray_mask = cv2.inRange(hsv, (0, 0, 50), (180, 30, 199))
-    color_counts["gray"] = int(cv2.countNonZero(gray_mask))
+    # Find the center of the brown region
+    mid_x = image.shape[1] // 2
+    left_brown = int(cv2.countNonZero(brown_mask[:, :mid_x]))
+    right_brown = int(cv2.countNonZero(brown_mask[:, mid_x:]))
 
-    black_mask = cv2.inRange(hsv, (0, 0, 0), (180, 255, 29))
-    color_counts["black"] = int(cv2.countNonZero(black_mask))
-
-    total_pixels = image.shape[0] * image.shape[1]
-    dominant = max(color_counts, key=color_counts.get)
-    dominant_pct = round(color_counts[dominant] / total_pixels * 100, 1)
-
-    # Build a sorted breakdown of all detected colors
-    breakdown = {
-        name: round(count / total_pixels * 100, 1)
-        for name, count in sorted(color_counts.items(), key=lambda x: -x[1])
-        if count > 0
-    }
-
-    return {
-        "dominant_color": dominant,
-        "dominant_pct": dominant_pct,
-        "breakdown": breakdown,
-    }
+    # Steer away from the object
+    return "LEFT" if right_brown >= left_brown else "RIGHT"
 
 
 async def handle_client(websocket):
@@ -135,13 +148,17 @@ async def handle_client(websocket):
             cv2.imwrite(save_path, image)
             print(f"[*] Saved image ({image.shape[1]}x{image.shape[0]}) → {save_path}")
 
-            # Detect color
-            result = detect_dominant_color(image)
-            result["saved_to"] = save_path
-            result["resolution"] = f"{image.shape[1]}x{image.shape[0]}"
+            # Detect obstruction first (close-up objects), then brown objects
+            obstruction_dir = detect_obstruction(image)
+            direction = obstruction_dir or detect_brown_direction(image)
 
-            await websocket.send(json.dumps(result))
-            print(f"[*] Dominant color: {result['dominant_color']} ({result['dominant_pct']}%)")
+            if direction:
+                source = "obstruction" if obstruction_dir else "brown"
+                await websocket.send(direction)
+                print(f"[*] {source.capitalize()} detected → steer {direction}")
+            else:
+                await websocket.send("NONE")
+                print("[*] No obstruction or brown object detected")
 
     except websockets.ConnectionClosed:
         print(f"[-] Client disconnected: {websocket.remote_address}")
